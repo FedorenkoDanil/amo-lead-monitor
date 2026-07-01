@@ -38,8 +38,10 @@ def get_user_name(user_id):
     return data.get("name", f"Менеджер #{user_id}")
 
 
-def has_already_notified(notes):
-    """Check if we already sent a notification for this lead (dedup)."""
+def has_already_notified(lead_id):
+    """Check if we already sent a notification for this lead (dedup). Fetches all notes."""
+    notes_data = amo_get(f"/api/v4/leads/{lead_id}/notes", {"limit": 50})
+    notes = notes_data.get("_embedded", {}).get("notes", [])
     for note in notes:
         if note.get("note_type") == "common":
             text = (note.get("params") or {}).get("text", "") or ""
@@ -184,7 +186,7 @@ def webhook():
 
         processed, notes = check_lead_processed(lead_id, created_at)
         if not processed:
-            if has_already_notified(notes):
+            if has_already_notified(lead_id):
                 return "Already notified, skip", 200
             mark_as_notified(lead_id)
             send_telegram_alert(lead_id, lead_name, responsible_name, created_at)
