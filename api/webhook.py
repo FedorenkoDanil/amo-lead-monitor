@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -11,6 +11,8 @@ AMO_DOMAIN = os.environ.get("AMO_DOMAIN", "")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 NEW_LEAD_STATUS_ID = int(os.environ.get("NEW_LEAD_STATUS_ID", "81146518"))
+TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "3"))  # UTC+3 by default
+NOTIFIED_TAG = "[AMO_MONITOR_NOTIFIED]"
 
 AMO_HEADERS = {
     "Authorization": f"Bearer {AMO_TOKEN}",
@@ -36,13 +38,37 @@ def get_user_name(user_id):
     return data.get("name", f"Менеджер #{user_id}")
 
 
+def has_already_notified(notes):
+    """Check if we already sent a notification for this lead (dedup)."""
+    for note in notes:
+        if note.get("note_type") == "common":
+            text = (note.get("params") or {}).get("text", "") or ""
+            if NOTIFIED_TAG in text:
+                return True
+    return False
+
+
+def mark_as_notified(lead_id):
+    """Add a hidden note to the lead so we don't notify twice."""
+    try:
+        requests.post(
+            f"{AMO_BASE}/api/v4/leads/{lead_id}/notes",
+            headers=AMO_HEADERS,
+            json=[{"note_type": "common", "params": {"text": NOTIFIED_TAG}}],
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def check_lead_processed(lead_id, lead_created_at):
+    """Returns (is_processed, notes_list)."""
     lead = amo_get(f"/api/v4/leads/{lead_id}")
     if not lead:
-        return True
+        return True, []
 
     if lead.get("status_id") != NEW_LEAD_STATUS_ID:
-        return True
+        return True, []
 
     notes_data = amo_get(f"/api/v4/leads/{lead_id}/notes", {"limit": 50})
     notes = notes_data.get("_embedded", {}).get("notes", [])
@@ -55,25 +81,26 @@ def check_lead_processed(lead_id, lead_created_at):
         created_by = note.get("created_by", 0)
         params = note.get("params", {}) or {}
 
-        # Outgoing call (S3 or any telephony)
         if note_type == "call_out":
-            return True
+            return True, notes
 
-        # Wazzup / S3 outgoing messages
         if note_type in ("extended_service_message", "service_message"):
             direction = params.get("direction") or params.get("type") or ""
             if str(direction).lower() in ("out", "2", "outgoing"):
-                return True
+                return True, notes
 
-        # Note manually written by a real manager
+        # Note manually written by a real manager (skip our own dedup tag)
         if note_type == "common" and created_by and created_by != 0:
-            return True
+            text = params.get("text", "") or ""
+            if NOTIFIED_TAG not in text:
+                return True, notes
 
-    return False
+    return False, notes
 
 
 def send_telegram_alert(lead_id, lead_name, responsible_name, created_at):
-    time_str = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
+    tz = timezone(timedelta(hours=TZ_OFFSET))
+    time_str = datetime.fromtimestamp(created_at, tz=tz).strftime("%d.%m %H:%M")
     url = f"https://{AMO_DOMAIN}/leads/detail/{lead_id}"
     text = (
         f"\U0001f534 <b>Заявка не отработана за 5 минут!</b>\n\n"
@@ -155,7 +182,11 @@ def webhook():
         responsible_id = lead.get("responsible_user_id")
         responsible_name = get_user_name(responsible_id)
 
-        if not check_lead_processed(lead_id, created_at):
+        processed, notes = check_lead_processed(lead_id, created_at)
+        if not processed:
+            if has_already_notified(notes):
+                return "Already notified, skip", 200
+            mark_as_notified(lead_id)
             send_telegram_alert(lead_id, lead_name, responsible_name, created_at)
             return "Alert sent", 200
 
